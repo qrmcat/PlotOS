@@ -6,16 +6,11 @@ ipc.DEFAULT_TIMEOUT = 5 -- seconds
 
 function ipc.call(name, ...)
     if not ipc.handlers[name] then
-        return false, "No such handler"
+        return false, "IPC handler not found: " .. tostring(name)
     end
-
-    local ret
-    while not ret or ret[1] ~= "ipc_response" do
-        ret = table.pack(coroutine.yield("ipc_call", name, table.pack(...)))
-    end
-    
-    
-    return table.unpack(ret, 1, ret.n)
+    -- Yield to the scheduler; it will dispatch the call and resume us with
+    -- the handler's return values set directly in sysret.
+    return coroutine.yield("ipc_call", name, table.pack(...))
 end
 
 function ipc.register(name, handler)
@@ -28,9 +23,10 @@ function ipc.register(name, handler)
     --    return false, "No active process"
     --end
     
-    -- Add cleanup hook
+    -- Add cleanup hook.
+    -- NOTE: on/off/emit are plain functions (not methods), use . not : syntax.
     if proc then
-        proc:on("exit", function()
+        proc.on("exit", function()
             ipc.handlers[name] = nil
         end)
     end
@@ -79,19 +75,44 @@ end
 
 function ipc.tick_me(event)
     if event[1] == "ipc_request" then
-        local name = event[2]
-        local processe = event[3]
-        local args = event[4] or {}
-        local handler = ipc.handlers[name]
-        if process.currentProcess ~= handler.process then
-            printk("Process " .. process.currentProcess.pid .. " is trying to call " .. name .. " but it's owned by " .. handler.process.pid..", dropping")
+        local name     = event[2]
+        local caller   = event[3]  -- the process that made the ipc_call
+        local args     = event[4] or {}  -- handler_args table (NOT unpacked)
+        local handler  = ipc.handlers[name]
+
+        if not handler then
+            printk("ipc.tick_me: received request for unknown handler '" .. tostring(name) .. "'", "warn")
             return false
         end
-        local ret = table.pack(handler.handler(table.unpack(args, 1, args.n)))
+
+        local cur = process.currentProcess
+        if cur ~= handler.process then
+            local cur_pid = cur and tostring(cur.pid) or "(kernel)"
+            printk("ipc.tick_me: process " .. cur_pid ..
+                " received ipc_request for '" .. name ..
+                "' but owner is pid " .. tostring(handler.process and handler.process.pid) ..
+                " — dropping", "warn")
+            return false
+        end
+
+        printk("ipc.tick_me: dispatching '" .. name ..
+            "' for caller pid " .. tostring(caller and caller.pid), "debug")
+
+        local ok, res = xpcall(function()
+            return table.pack(handler.handler(table.unpack(args, 1, args.n)))
+        end, function(e)
+            return e .. "\n" .. debug.traceback("", 2)
+        end)
+
+        if not ok then
+            printk("ipc.tick_me: handler '" .. name .. "' crashed: " .. tostring(res), "error")
+            res = table.pack(false, "IPC handler error: " .. tostring(res))
+        end
+
         if coroutine.isyieldable() then
-            coroutine.yield("ipc_response", processe.pid, table.unpack(ret, 1, ret.n))
+            coroutine.yield("ipc_response", caller.pid, table.unpack(res, 1, res.n))
         else
-            return { "ipc_response", processe.pid, table.unpack(ret, 1, ret.n) }
+            return { "ipc_response", caller.pid, table.unpack(res, 1, res.n) }
         end
         return true
     end

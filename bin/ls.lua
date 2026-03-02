@@ -1,7 +1,6 @@
 local std = require("stdlib")
 local fs = require("fs")
-
-local gpu = require("driver").load("gpu")
+local A  = require("terminal").ansi
 
 local function canonicalizePath(p)
     local path = std.str.split(p, "/")
@@ -30,11 +29,10 @@ if not fs.exists(path) then
     print("ls: cannot access '"..({...})[1][2]..": No such file or directory")
 else
     for name in fs.list(path) do
-        if name:sub(#name,#name) == "/" then
-            gpu.setForeground(0x0570ee)
+        if name:sub(#name, #name) == "/" then
+            print(A.bblue .. name .. A.reset)
         else
-            gpu.setForeground(0xffffff)
+            print(name)
         end
-        print(name)
     end
 end

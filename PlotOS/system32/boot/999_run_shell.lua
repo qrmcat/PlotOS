@@ -26,6 +26,7 @@ local e, process = xpcall(require, function(e)
     bsod(e, true)
 end, "process")
 if not e then
+    bsod("Failed to load process library: " .. tostring(process))
     while true do
         pcps()
     end

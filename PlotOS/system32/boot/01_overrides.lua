@@ -11,7 +11,7 @@ computer.pullSignal = function(tout)
     if proc then
         --coroutine.yield()
         -- Insert a new signal with timeout and start time into the process's signal pull
-        table.insert(proc.io.signal.pull, { timeout = math.max(tout, 0.05) or math.huge, start_at = computer.uptime() })
+        table.insert(proc.io.signal.pull, { timeout = tout and math.max(tout, 0.05) or math.huge, start_at = computer.uptime() })
         local signalIndex = #proc.io.signal.pull
         while true do
             -- If the signal has a return value, unpack it and remove the signal from the pull

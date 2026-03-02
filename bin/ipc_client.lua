@@ -1,4 +1,4 @@
 local ipc = require("ipc")
 local ser = require("serialization")
 
-print(ipc.call("test"))
+print(ipc.call("shell"))

@@ -6,7 +6,7 @@ local process = package.require("process")
 local cp = component
 ret.loaded = {}
 local drivers = {}
-local driver_cache = {}
+local driver_cache = {}  -- stores raw driver instances (kernel-side only)
 
 function generate_unique_id()
     -- generate a unique id, 16 chars a-z0-9
@@ -133,170 +133,85 @@ local segg = function(e)
     return e, debug.traceback("", 1)
 end
 
-function newdriver(d, addr)
-    local ok, dd, tb = xpcall(d.new, function(e) return e, debug.traceback("", 1) end, addr)
+--- Instantiate a raw driver object for an address. This is KERNEL-ONLY;
+--- processes must never receive the raw instance — they get a syscall proxy.
+local function newdriver(d, addr)
+    printk("[driver] instantiating driver '" .. d.getName() .. "' for addr " .. tostring(addr), "debug")
+    local ok, dd, tb = xpcall(d.new,
+        function(e) return e, debug.traceback("", 1) end, addr)
     if not ok then
         bsod("Failed to load driver: " .. dd, false, tb)
     end
-    dd.getDriverName = d.getName
+    dd.getDriverName    = d.getName
     dd.getDriverVersion = d.getVersion
-    -- wrap all methods in a xpcall so when called and errors, throws a bsod
-    --[[if reg.get("system/security/driver_crash_bsod") == 1 then
-        for k, v in pairs(dd) do
-            if type(v) == "function" then
-                dd[k] = function(...)
-                    local re = { xpcall(v, segg, ...) }
-                    if not re[1] then
-                        bsod("Failed to call driver method: " .. re[2], false, re[3])
-                    end
-                    return table.unpack(re, 2)
-                end
-            end
-        end
-    end]]
-
-    --local drv_ipc_id = "driver_"..generate_unique_id()
-
-    --[[for k,v in pairs(dd) do
-        if type(v) == "function" then
-            dd[k] = function(...)
-                if process.currentProcess then
-                    local re = { ipc.call(drv_ipc_id, ...)}
-                    printk("Driver method "..k.." returned "..tostring(re[1]))
-                    return table.unpack(re)
-                else
-                    printk("Driver method "..k.." called")
-                    return v(...)
-                end
-            end
-        end
-    end
-
-    ipc.register(drv_ipc_id, function(method, ...)
-    printk("Driver method "..method.." called")
-        if not dd[method] then
-            return false, "Method not found"
-        end
-        local ok, ret = xpcall(dd[method], function(e) return e, debug.traceback("", 1) end, ...)
-        if not ok then
-            bsod("Failed to call driver method: " .. ret, false, debug.traceback("", 1))
-        end
-        return true, ret
-    end)]]
-
-    --[[ipc.register("driver", function(driver, addr, method, ...)
-        local drv = ret.load(driver, addr)
-        if not drv then
-            return false, "No driver found"
-        end
-        if not drv[method] then
-            return false, "Method not found"
-        end
-        local ok, ret = xpcall(drv[method], function(e) return e, debug.traceback("", 1) end, ...)
-        if not ok then
-            bsod("Failed to call driver method: " .. ret, false, debug.traceback("", 1))
-        end
-        return true, ret
-
-    end)]]
-
-    local _ret = dd
-    --[[
-    if process.currentProcess then
-        _ret = {}
-        setmetatable(_ret, {
-            __index = function(t, k)
-                if type(dd[k]) == "function" then
-                    return function(...)
-                        return coroutine.yield("driver", addr, k, ...)
-                    end
-                else
-                    return dd[k]
-                end
-            end
-        })
-    end
-    ]]
-
     return dd
 end
 
 function ret.load(typed, addr)
     if not addr then addr = "default" end
 
+    -- Step 1: resolve "default" to an actual address and driver module.
+    local resolved_addr = addr
+    local d_module = nil
     if addr == "default" then
-        local d, addra = ret.getDefault(typed)
-        if d and addra then
-            local dd = newdriver(d, addra)
-            dd.getDriverName = d.getName
-            dd.getDriverVersion = d.getDriverVersion
-            dd.address = addra
-            driver_cache[addra] = dd
-
-            local dd_proxy = {}
-            if process.currentProcess ~= nil then
-                setmetatable(dd_proxy, {
-                    __index = function(t, k)
-                        if type(dd[k]) == "function" then
-                            return function(...)
-                                return coroutine.yield("driver", addra, k, ...)
-                            end
-                        else
-                            return dd[k]
-                        end
-                    end
-                })
-            else
-                printk("A driver has been loaded outside of a process (kernel or we have a major security issue)")
-                dd_proxy = dd
-            end
-
-            --dd_proxy = dd
-
-            return dd_proxy
-        else
-            return nil, "No drivers found"
+        d_module, resolved_addr = ret.getDefault(typed)
+        if not (d_module and resolved_addr) then
+            return nil, "No drivers found for type: " .. tostring(typed)
         end
     else
-        if driver_cache[addr] then
-            return driver_cache[addr]
+        d_module = ret.getBest(typed, addr)
+        if not d_module then
+            return nil, "No driver found for addr: " .. tostring(addr) ..
+                " type: " .. tostring(typed)
         end
-        local d = ret.getBest(typed, addr)
-        if d then
-            local dd = newdriver(d, addr)
-            dd.getDriverName = d.getName
-            dd.getDriverVersion = d.getVersion
-            dd.address = addr
-            driver_cache[addr] = dd
+    end
 
-            local dd_proxy = {}
+    -- Step 2: get or create the raw driver instance in the kernel cache.
+    -- driver_cache is kernel-internal; processes must never receive it directly.
+    local dd = driver_cache[resolved_addr]
+    if not dd then
+        dd = newdriver(d_module, resolved_addr)
+        dd.getDriverName    = d_module.getName
+        dd.getDriverVersion = d_module.getVersion
+        dd.address = resolved_addr
+        driver_cache[resolved_addr] = dd
+        printk("[driver] cached '" .. d_module.getName() ..
+            "' at " .. tostring(resolved_addr), "debug")
+    end
 
-            if process.currentProcess ~= nil then
-                setmetatable(dd_proxy, {
-                    __index = function(t, k)
-                        if type(dd[k]) == "function" then
-                            return function(...)
-                                return coroutine.yield("driver", addr, k, ...)
-                            end
-                        else
-                            return dd[k]
-                        end
+    -- Step 3: return a syscall proxy to processes, raw driver to kernel.
+    -- The proxy routes every function call through coroutine.yield("driver", ...)
+    -- so only the scheduler (tickProcess) ever calls the real driver methods —
+    -- the process itself never has direct access.
+    if process.currentProcess ~= nil then
+        printk("[driver] proxy for '" .. d_module.getName() ..
+            "' issued to pid " .. process.currentProcess.pid, "debug")
+        local dd_proxy = {}
+        setmetatable(dd_proxy, {
+            __index = function(t, k)
+                local raw = dd[k]
+                if type(raw) == "function" then
+                    return function(...)
+                        return coroutine.yield("driver", resolved_addr, k, ...)
                     end
-                })
-            else
-                printk("Driver " .. d.getName() .. " has been loaded kernel-side", "warn")
-                dd_proxy = dd
+                else
+                    return raw
+                end
             end
-
-            --dd_proxy = dd
-
-            return dd_proxy
-        else
-            return nil, "No drivers found"
-        end
+        })
+        return dd_proxy
+    else
+        printk("[driver] kernel-side load of '" .. d_module.getName() ..
+            "' at " .. tostring(resolved_addr), "warn")
+        return dd
     end
 end
 
+--- Returns the raw (kernel-side) driver instance from the cache.
+--- Must only be called from the kernel / scheduler (tickProcess).
+--- Processes must never call this — they receive proxies from ret.load().
+--- @param addr string Component address.
+--- @return table|nil Raw driver instance or nil if not cached.
 function ret.fromCache(addr)
     return driver_cache[addr]
 end

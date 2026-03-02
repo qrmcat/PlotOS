@@ -1,9 +1,11 @@
-local std = require("stdlib")
-local fs = require("fs")
-local gpu = require("driver").load("gpu")
+local std     = require("stdlib")
+local fs      = require("fs")
 local process = require("process")
 local event   = require("event")
-local keyboard= require("keyboard")
+local Pipe    = require("pipe")
+
+-- ANSI color shortcuts
+local A = require("terminal").ansi
 
 -- Initialize environment
 local function initEnvironment()
@@ -56,11 +58,41 @@ local function findExecutable(cmd)
     return nil
 end
 
-local function executeCommand(binPath, args)
-    --local program, err = loadfile(binPath)
+
+local function handleError(message)
+    print(A.red .. tostring(message) .. A.reset)
+    printk(message)
+end
+
+-- Forward declaration: executePipeline references commands before its definition.
+local commands
+
+-- ── Pipeline helpers ───────────────────────────────────────────────────────────
+
+--- Split a command line on unquoted '|' characters.
+--- Returns a list of trimmed segment strings.
+local function parsePipeline(input)
+    local segments = {}
+    for seg in (input .. "|"):gmatch("([^|]*)|") do
+        seg = seg:match("^%s*(.-)%s*$")
+        if #seg > 0 then
+            segments[#segments + 1] = seg
+        end
+    end
+    return segments
+end
+
+--- Load a program file and create a process, optionally overriding its stdin/stdout
+--- file descriptors (used for pipe plumbing).
+--- @param binPath   string   Absolute path to the .lua program
+--- @param args      table    Argument list (args[1] = command name)
+--- @param stdinFd   table?   Replace fd[0] with this fd endpoint (pipe reader)
+--- @param stdoutFd  table?   Replace fd[1] with this fd endpoint (pipe writer)
+--- @return table|nil, string?
+local function spawnCommand(binPath, args, stdinFd, stdoutFd)
     local fileHandle = fs.open(binPath, "r")
     if not fileHandle then
-        return false, "Failed to open: " .. tostring(err)
+        return nil, "failed to open " .. binPath
     end
 
     local program = ""
@@ -68,46 +100,153 @@ local function executeCommand(binPath, args)
         local data, reason = fileHandle:read(1024)
         if not data then
             fileHandle:close()
-            if reason then
-                return false, "Failed to read: " .. tostring(reason)
-            end
+            if reason then return nil, "read error: " .. tostring(reason) end
             break
         end
         program = program .. data
     end
-    --print(program)
-    if not program then
-        return false, "Failed to load: " .. tostring(err)
-    end
-    
 
     local proc = process.new(fs.name(binPath), program, _G, nil, nil, args)
-    while proc.status ~= "dead" do
-        local e = event.pull(nil, 0)
-        if keyboard.isControlDown() and keyboard.isKeyDown("c") then
-            printk("Killing process due to user input of ^C")
-            proc:terminate()
-            print("Killed")
-        end
+
+    if stdinFd and proc.io and proc.io.fd then
+        proc.io.fd[0]  = stdinFd
+        proc.io.use_ld = false   -- pipe input bypasses line discipline
+    end
+    if stdoutFd and proc.io and proc.io.fd then
+        proc.io.fd[1] = stdoutFd
     end
 
-    
+    return proc
+end
+
+--- Run a single command, forwarding ^C/^Z to it via the shell's line discipline.
+local function executeCommand(binPath, args, stdinFd, stdoutFd)
+    local proc, err = spawnCommand(binPath, args, stdinFd, stdoutFd)
+    if not proc then
+        return false, err
+    end
+
+    -- Route ^C / ^Z to the child through the shell's line discipline fg_proc.
+    -- The line discipline's processKey() sees ^C and calls proc:signal("SIGINT").
+    local shellProc = process.currentProcess
+    if shellProc and shellProc.io and shellProc.io.ld then
+        shellProc.io.ld.fg_proc = proc
+    end
+
+    while proc.status ~= "dead" do
+        event.pull(nil, 0)
+    end
+
+    if shellProc and shellProc.io and shellProc.io.ld then
+        shellProc.io.ld.fg_proc = nil
+    end
+
     return true
 end
 
-local function handleError(message)
-    gpu.setForeground(0xFF0000)
-    print(tostring(message))
-    printk(message)
-    gpu.setForeground(0xFFFFFF)
+--- Execute a parsed pipeline.  If there is only one segment this degrades to a
+--- plain executeCommand.  Multiple segments are connected by Pipe objects so
+--- each command's stdout feeds the next command's stdin.
+local function executePipeline(segments)
+    if #segments == 0 then return true end
+
+    if #segments == 1 then
+        -- Fast path: no pipes.
+        local args = std.str.split(segments[1], " ")
+        local cmd  = args[1]
+        if not cmd or #cmd == 0 then return true end
+
+        if commands[cmd] then
+            commands[cmd](args)
+            return true
+        end
+
+        local binPath = findExecutable(cmd)
+        if not binPath then
+            print("shell: " .. cmd .. ": command not found")
+            return true
+        end
+
+        local ok, err = executeCommand(binPath, args)
+        if not ok then handleError("shell: " .. cmd .. ": " .. tostring(err)) end
+        return true
+    end
+
+    -- ── Multi-command pipeline ─────────────────────────────────────────────────
+    -- Build: proc[1].fd[1]→writer[1]  pipe[1]  reader[1]→proc[2].fd[0]
+    --        proc[2].fd[1]→writer[2]  pipe[2]  reader[2]→proc[3].fd[0]  etc.
+    local procs   = {}
+    local writers = {}   -- one writer per inter-process pipe (index = left segment)
+    local prevReader = nil
+
+    for i, seg in ipairs(segments) do
+        local args = std.str.split(seg, " ")
+        local cmd  = args[1]
+        if not cmd or #cmd == 0 then
+            print("shell: syntax error near '|'")
+            return true
+        end
+
+        local binPath = findExecutable(cmd)
+        if not binPath then
+            print("shell: " .. cmd .. ": command not found")
+            return true
+        end
+
+        -- Create a pipe between this command and the next (not after the last).
+        local reader, writer
+        if i < #segments then
+            reader, writer = Pipe.new()
+            writers[i] = writer
+        end
+
+        local proc, err = spawnCommand(binPath, args, prevReader, writer)
+        if not proc then
+            handleError("shell: " .. cmd .. ": " .. tostring(err))
+            return true
+        end
+
+        procs[#procs + 1] = proc
+        prevReader = reader   -- pipe read end becomes stdin of next command
+    end
+
+    -- Route ^C to the last process in the pipeline (Unix convention).
+    local shellProc = process.currentProcess
+    if shellProc and shellProc.io and shellProc.io.ld then
+        shellProc.io.ld.fg_proc = procs[#procs]
+    end
+
+    -- Wait for all processes; close a pipe's write end as soon as its producer
+    -- finishes so downstream consumers receive EOF.
+    while true do
+        event.pull(nil, 0)
+
+        local anyAlive = false
+        for i, p in ipairs(procs) do
+            if p.status ~= "dead" then
+                anyAlive = true
+            elseif writers[i] and not writers[i]._closed then
+                writers[i].close()
+                writers[i]._closed = true
+            end
+        end
+
+        if not anyAlive then break end
+    end
+
+    if shellProc and shellProc.io and shellProc.io.ld then
+        shellProc.io.ld.fg_proc = nil
+    end
+
+    return true
 end
 
 -- Command handlers
-local commands = {
+commands = {
     cd = function(args)
         local path = args[2] and canonicalizePath(tostring(args[2])) or "/"
         if not fs.exists(path) then
-            print("shell: cannot access '" .. args[2] .. "': No such file or directory")
+            print("shell: cannot access '" .. tostring(args[2]) .. "': No such file or directory")
             return
         end
         os.currentDirectory = path
@@ -117,43 +256,26 @@ local commands = {
 -- Main loop
 local function main()
     initEnvironment()
-    
+
     local history = {}
 
     while true do
         -- Display prompt
-        gpu.setForeground(0x00FF00)
-        io.write(os.getEnv("user") .. "@" .. os.getEnv("computerName") .. ":")
-        gpu.setForeground(0x2fa1c6)
-        io.write(os.currentDirectory .. "$ ")
-        gpu.setForeground(0xFFFFFF)
-        
-        -- Parse input
+        io.write(A.green .. os.getEnv("user") .. "@" .. os.getEnv("computerName") .. ":" .. A.reset)
+        io.write(A.cyan  .. os.currentDirectory .. "$ " .. A.reset)
+
+        -- Read input (routes through line discipline when use_ld=true)
         local input = io.read({history = history})
-        if #input > 0 and (not input:match("^%s")) then
+
+        -- Maintain history (skip blank / whitespace-only lines)
+        if input and #input > 0 and not input:match("^%s*$") then
             table.insert(history, input)
-            if #history > 64 then
-                table.remove(history, 1)
-            end
+            if #history > 64 then table.remove(history, 1) end
         end
-        local args = std.str.split(input or "", " ")
-        local cmd = args[1]
-        
-        if cmd and #cmd > 0 then
-            if commands[cmd] then
-                commands[cmd](args)
-            else
-                local binPath = findExecutable(cmd)
-                if not binPath then
-                    print("shell: " .. cmd .. ": command not found")
-                else
-                    local success, err = executeCommand(binPath, args)
-                    if not success then
-                        handleError("shell: program '" .. cmd .. "' " .. err)
-                    end
-                end
-            end
-        end
+
+        -- Parse pipeline and execute
+        local segments = parsePipeline(input or "")
+        executePipeline(segments)
     end
 end
 
